@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Prerequisites:**
 - [Rust](https://rustup.rs/) (latest stable)
 - [Bun](https://bun.sh/) package manager
+- Platform-specific dependencies (see BUILD.md for details)
 
 **Core Development:**
 ```bash
@@ -25,14 +26,15 @@ bun run tauri build
 bun run dev        # Start Vite dev server
 bun run build      # Build frontend (TypeScript + Vite)
 bun run preview    # Preview built frontend
+
+# Type checking
+bunx tsc --noEmit  # Run TypeScript type checker
 ```
 
 **Model Setup (Required for Development):**
 ```bash
-# Create models directory
+# Create models directory and download VAD model
 mkdir -p src-tauri/resources/models
-
-# Download required VAD model
 curl -o src-tauri/resources/models/silero_vad_v4.onnx https://blob.handy.computer/silero_vad_v4.onnx
 ```
 
@@ -74,16 +76,22 @@ Handy is a cross-platform desktop speech-to-text application built with Tauri (R
 
 **Core Libraries:**
 - `whisper-rs` - Local Whisper inference with GPU acceleration
-- `cpal` - Cross-platform audio I/O  
-- `vad-rs` - Voice Activity Detection
-- `rdev` - Global keyboard shortcuts
+- `transcribe-rs` - CPU-optimized Parakeet V3 model support
+- `cpal` - Cross-platform audio I/O
+- `vad-rs` - Voice Activity Detection (Silero VAD)
+- `rdev` - Global keyboard shortcuts and system events
 - `rubato` - Audio resampling
 - `rodio` - Audio playback for feedback sounds
+- `tauri-plugin-store` - Settings persistence
 
 **Platform-Specific Features:**
 - macOS: Metal acceleration for Whisper, accessibility permissions
 - Windows: Vulkan acceleration, code signing
 - Linux: OpenBLAS + Vulkan acceleration
+
+**Available Models:**
+- Whisper Small/Medium/Turbo/Large (GPU-accelerated)
+- Parakeet V3 (CPU-optimized with auto language detection)
 
 ### Application Flow
 
@@ -104,3 +112,57 @@ Settings are stored using Tauri's store plugin with reactive updates:
 ### Single Instance Architecture
 
 The app enforces single instance behavior - launching when already running brings the settings window to front rather than creating a new process.
+
+## Code Style Guidelines
+
+**Rust (Backend):**
+- Use `anyhow::Error` for error handling with descriptive context messages
+- Prefer `Arc<Mutex<T>>` for shared state in managers
+- Log with appropriate levels: `debug!()`, `info!()`, `eprintln!()` for errors
+- Builder pattern for initialization chains
+- Snake_case for functions and variables, PascalCase for types
+- Separate logical sections with comment blocks: `/* ─────────── */`
+- Use `?` operator with anyhow context for error propagation
+
+**TypeScript/React (Frontend):**
+- Functional components with TypeScript interfaces
+- Zod schemas for type validation and inference (see `src/lib/types.ts`)
+- `useCallback` hooks for stable function references in components
+- Destructure props with defaults: `{ disabled = false }`
+- Prefer interface aliases over type aliases for objects
+- PascalCase for components, camelCase for variables/functions
+- Use `import type` for TypeScript type imports
+
+**Error Handling:**
+- Frontend: Try/catch with user feedback via toast notifications, rollback optimistic updates
+- Backend: `?` operator with `.context()` for descriptive error messages
+- Log errors at appropriate debug levels
+
+**Component Patterns:**
+- Container component pattern for layout (see `App.tsx`)
+- Composition over inheritance
+- Use Zustand for global state management (see `src/stores/`)
+- Minimize prop drilling with context where appropriate
+
+## Important Development Notes
+
+**Manager Initialization:**
+- All managers (Audio, Model, Transcription, History) are initialized in `lib.rs` and managed via Tauri state
+- Managers use `Arc<Mutex<T>>` for thread-safe shared access
+- Frontend accesses managers via Tauri commands in `src-tauri/src/commands/`
+
+**Audio Processing Pipeline:**
+- Recording happens in `audio_toolkit/audio/recorder.rs`
+- VAD filtering in `audio_toolkit/vad/` (Silero model required)
+- Resampling in `audio_toolkit/audio/resampler.rs` (48kHz → 16kHz for Whisper)
+- Transcription orchestrated by `managers/transcription.rs`
+
+**Settings Management:**
+- Settings stored using `tauri-plugin-store` with JSON persistence
+- Reactive updates via events from backend to frontend
+- Frontend hooks in `src/hooks/` provide reactive access to settings
+
+**Platform Permissions:**
+- macOS requires accessibility and microphone permissions
+- Handled via `tauri-plugin-macos-permissions` and native permissions API
+- Permission checks in `AccessibilityPermissions.tsx`
