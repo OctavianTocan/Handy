@@ -166,16 +166,27 @@ pub struct AppSettings {
 
 ### Small LLM Post-Processing Options
 **Recommended models for enhancement:**
+
+#### Local Models (Privacy-first)
 1. **IBM Granite 3.1 (quantized via Ollama)** - 2B/8B variants, Apache 2.0 license
 2. **Qwen2.5/Qwen3 (quantized)** - Excellent instruction following
 3. **Ollama Cloud** - Powerful models, privacy-preserving per policy
 4. **Jan Nano** - Huge context window, great performance
 5. **Phi-3.5-mini** - Microsoft's efficient model
 
+#### Cloud/Hybrid Options (Unlimited powerful models)
+6. **Claude Code (Headless)** - Non-interactive CLI calls to Claude for enhancement
+7. **Gemini CLI** - Google's Gemini via headless terminal commands
+8. **GitHub Models** - Free tier access to GPT-4, Claude, Llama, etc.
+9. **GitHub Copilot OAuth** - Unlimited use via Copilot subscription (GPT-4 Turbo)
+10. **z.ai (Cosing plan)** - Free powerful models with generous limits
+
 **Integration approach:**
-- Use Ollama for local model management
-- Optional cloud fallback for power users
+- **Tier 1 (Local):** Ollama, Jan for privacy-first users
+- **Tier 2 (Cloud Free):** GitHub Models, Gemini CLI, z.ai for power without cost
+- **Tier 3 (Cloud Premium):** Claude Code, Copilot OAuth for best quality
 - Sentence-level chunking for responsiveness
+- Automatic fallback: Cloud → Local if API fails
 
 ### Cloud Provider Integration
 **Philosophy shift:** Local-first, cloud-optional
@@ -1220,6 +1231,108 @@ async fn transcribe_and_paste_with_enhancement(audio: Vec<f32>) -> Result<()> {
     Ok(())
 }
 
+// LLM Enhancement with multi-provider support
+async fn apply_llm_enhancement(text: &str, config: &LLMConfig) -> Result<String> {
+    match &config.provider {
+        LLMProvider::Local { model } => {
+            // Ollama/Jan local inference
+            ollama_generate(text, model, &config.system_prompt).await
+        },
+        LLMProvider::ClaudeCodeHeadless => {
+            // Headless Claude Code CLI call
+            let output = Command::new("claude")
+                .arg("--headless")
+                .arg("--prompt")
+                .arg(format!("{}\n\nText: {}", config.system_prompt, text))
+                .output()
+                .await?;
+
+            Ok(String::from_utf8(output.stdout)?)
+        },
+        LLMProvider::GeminiCLI { api_key } => {
+            // Gemini via CLI
+            let output = Command::new("gemini")
+                .arg("--api-key")
+                .arg(api_key)
+                .arg("--prompt")
+                .arg(format!("{}\n\nText: {}", config.system_prompt, text))
+                .output()
+                .await?;
+
+            Ok(String::from_utf8(output.stdout)?)
+        },
+        LLMProvider::GitHubModels { token, model } => {
+            // GitHub Models API (free tier)
+            let client = reqwest::Client::new();
+            let response = client
+                .post("https://models.inference.ai.azure.com/chat/completions")
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&json!({
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": config.system_prompt},
+                        {"role": "user", "content": text}
+                    ]
+                }))
+                .send()
+                .await?
+                .json::<serde_json::Value>()
+                .await?;
+
+            Ok(response["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or(text)
+                .to_string())
+        },
+        LLMProvider::GitHubCopilot { oauth_token } => {
+            // Copilot OAuth (unlimited GPT-4 Turbo)
+            let client = reqwest::Client::new();
+            let response = client
+                .post("https://api.githubcopilot.com/chat/completions")
+                .header("Authorization", format!("Bearer {}", oauth_token))
+                .json(&json!({
+                    "model": "gpt-4-turbo",
+                    "messages": [
+                        {"role": "system", "content": config.system_prompt},
+                        {"role": "user", "content": text}
+                    ]
+                }))
+                .send()
+                .await?
+                .json::<serde_json::Value>()
+                .await?;
+
+            Ok(response["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or(text)
+                .to_string())
+        },
+        LLMProvider::ZaiCosing { api_key } => {
+            // z.ai Cosing plan (free powerful models)
+            let client = reqwest::Client::new();
+            let response = client
+                .post("https://api.z.ai/v1/chat/completions")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&json!({
+                    "model": config.model.as_deref().unwrap_or("default"),
+                    "messages": [
+                        {"role": "system", "content": config.system_prompt},
+                        {"role": "user", "content": text}
+                    ]
+                }))
+                .send()
+                .await?
+                .json::<serde_json::Value>()
+                .await?;
+
+            Ok(response["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or(text)
+                .to_string())
+        },
+    }
+}
+
 async fn replace_selected_text_with_animation(new_text: &str) -> Result<()> {
     // Delete current selection (raw text)
     simulate_key_press(Key::Backspace)?;
@@ -1257,7 +1370,48 @@ pub struct EnhancementSettings {
     // Visual feedback
     show_diff_notification: bool,      // Default: true ("Enhanced 3 words")
 }
+
+pub enum LLMProvider {
+    Local {
+        model: String,  // "granite3.1:2b", "qwen2.5:0.5b", etc.
+    },
+    ClaudeCodeHeadless,  // Uses `claude` CLI
+    GeminiCLI {
+        api_key: String,
+    },
+    GitHubModels {
+        token: String,
+        model: String,  // "gpt-4", "claude-3-5-sonnet", "llama-3.1-405b", etc.
+    },
+    GitHubCopilot {
+        oauth_token: String,  // Via GitHub OAuth flow
+    },
+    ZaiCosing {
+        api_key: String,
+    },
+}
+
+pub struct LLMConfig {
+    provider: LLMProvider,
+    system_prompt: String,  // e.g., "Fix grammar and make professional"
+    model: Option<String>,  // Override default model
+    max_tokens: u32,        // Response length limit
+    temperature: f32,       // Creativity level
+}
 ```
+
+**Provider Benefits:**
+
+| Provider | Cost | Speed | Quality | Privacy | Setup |
+|----------|------|-------|---------|---------|-------|
+| **Local (Ollama)** | Free | Fast | Good | 100% | Easy |
+| **Claude Code Headless** | Free* | Medium | Excellent | Partial | Medium |
+| **Gemini CLI** | Free tier | Fast | Very Good | Partial | Easy |
+| **GitHub Models** | Free | Fast | Excellent | Partial | Easy (PAT) |
+| **GitHub Copilot** | $10/mo | Fast | Excellent | Partial | Medium (OAuth) |
+| **z.ai Cosing** | Free | Fast | Very Good | Partial | Easy |
+
+*Free with Claude Code subscription
 
 **Edge Cases:**
 1. **User starts typing before enhancement completes:**
