@@ -1732,14 +1732,1299 @@ Settings
 
 ---
 
+---
+
+## Intelligent Autocomplete System
+
+### Concept: Learn from Voice, Assist with Keyboard
+
+**Vision:** Transform Handy from reactive (voice → text) to proactive (learns patterns → suggests completions).
+
+**Core Idea:**
+- User dictates text via voice (existing functionality)
+- Handy learns common phrases, patterns, sentence structures
+- When user types normally (keyboard), Handy suggests completions
+- Simple frequency-based approach (no complex AI needed initially)
+
+---
+
+### How It Works
+
+#### Learning Phase (Automatic)
+```
+User dictates: "Best regards, Octavian"
+                ↓
+Handy stores approved transcription
+                ↓
+Database: { phrase: "Best regards,", frequency: 1 }
+                ↓
+User dictates again: "Best regards, Octavian"
+                ↓
+Database: { phrase: "Best regards,", frequency: 2 }
+```
+
+#### Suggestion Phase (While Typing)
+```
+User types: "Best reg|"
+                    ↑ cursor
+
+Handy searches database for matches:
+  - "Best regards," (frequency: 15, accepted: 8)
+  - "Best regional practices" (frequency: 2, accepted: 0)
+                    ↓
+Displays top match as ghost text:
+"Best regards,
+Octavian"
+         ^^^^^ (dimmed gray text)
+                    ↓
+User presses Tab → accepts suggestion
+                    ↓
+Database: { phrase: "Best regards,", accepted_count: 9 }
+```
+
+---
+
+### Architecture
+
+#### Simple Frequency-Based Engine (Phase 1)
+
+```rust
+pub struct AutocompleteEngine {
+    phrases: HashMap<String, PhraseStats>,
+    max_phrases: usize,  // Limit to 10,000 to avoid bloat
+}
+
+struct PhraseStats {
+    text: String,
+    frequency: u32,           // How often phrase appears in transcriptions
+    accepted_count: u32,      // How often user accepted this suggestion
+    rejected_count: u32,      // How often user ignored this suggestion
+    last_used: DateTime<Utc>,
+    source: PhraseSource,     // Where phrase came from
+}
+
+enum PhraseSource {
+    Transcription,           // From voice dictation
+    AutocompleteAccept,      // From accepting autocomplete
+    Manual,                  // From typing (opt-in only, privacy concern)
+}
+
+impl AutocompleteEngine {
+    fn suggest(&self, current_text: &str, max_results: usize) -> Vec<Suggestion> {
+        // Find phrases that start with current text
+        let mut matches: Vec<_> = self.phrases.iter()
+            .filter(|(phrase, _)| phrase.starts_with(current_text))
+            .map(|(phrase, stats)| {
+                // Scoring algorithm (simple but effective)
+                let score =
+                    (stats.frequency as f32 * 1.0) +        // Base frequency
+                    (stats.accepted_count as f32 * 3.0) -   // Heavily favor accepted
+                    (stats.rejected_count as f32 * 0.5) +   // Penalize rejected
+                    (recency_boost(stats.last_used));       // Recent = better
+
+                Suggestion {
+                    text: phrase.clone(),
+                    score,
+                    stats: stats.clone(),
+                }
+            })
+            .collect();
+
+        // Sort by score descending
+        matches.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+        // Return top N
+        matches.into_iter().take(max_results).collect()
+    }
+
+    fn learn_from_transcription(&mut self, text: &str) {
+        // Extract meaningful phrases
+        let phrases = extract_phrases(text);
+
+        for phrase in phrases {
+            self.phrases
+                .entry(phrase.clone())
+                .and_modify(|stats| {
+                    stats.frequency += 1;
+                    stats.last_used = Utc::now();
+                })
+                .or_insert(PhraseStats {
+                    text: phrase,
+                    frequency: 1,
+                    accepted_count: 0,
+                    rejected_count: 0,
+                    last_used: Utc::now(),
+                    source: PhraseSource::Transcription,
+                });
+        }
+
+        // Prune if over limit
+        if self.phrases.len() > self.max_phrases {
+            self.prune_least_useful();
+        }
+    }
+
+    fn on_suggestion_accepted(&mut self, phrase: &str) {
+        if let Some(stats) = self.phrases.get_mut(phrase) {
+            stats.accepted_count += 1;
+            stats.last_used = Utc::now();
+        }
+    }
+
+    fn on_suggestion_rejected(&mut self, phrase: &str) {
+        if let Some(stats) = self.phrases.get_mut(phrase) {
+            stats.rejected_count += 1;
+        }
+    }
+}
+
+fn extract_phrases(text: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+
+    // 1. Complete sentences
+    for sentence in text.split(&['.', '!', '?']) {
+        let trimmed = sentence.trim();
+        if trimmed.len() > 5 {  // Ignore very short
+            phrases.push(format!("{}{}", trimmed, "."));
+        }
+    }
+
+    // 2. Common patterns (greetings, sign-offs)
+    let common_starters = ["Hello", "Hi", "Thanks", "Best regards", "Sincerely"];
+    for line in text.lines() {
+        for starter in common_starters {
+            if line.starts_with(starter) {
+                phrases.push(line.to_string());
+            }
+        }
+    }
+
+    // 3. Multi-word sequences (3-10 words)
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for window_size in 3..=10 {
+        for window in words.windows(window_size) {
+            phrases.push(window.join(" "));
+        }
+    }
+
+    phrases
+}
+
+fn recency_boost(last_used: DateTime<Utc>) -> f32 {
+    let days_ago = (Utc::now() - last_used).num_days();
+
+    match days_ago {
+        0 => 5.0,      // Used today: big boost
+        1..=7 => 2.0,  // Used this week: medium boost
+        8..=30 => 1.0, // Used this month: small boost
+        _ => 0.0,      // Older: no boost
+    }
+}
+```
+
+---
+
+#### Storage Schema
+
+```sql
+CREATE TABLE autocomplete_phrases (
+    id INTEGER PRIMARY KEY,
+    phrase TEXT UNIQUE NOT NULL,
+    frequency INTEGER DEFAULT 1,
+    accepted_count INTEGER DEFAULT 0,
+    rejected_count INTEGER DEFAULT 0,
+    last_used DATETIME DEFAULT CURRENT_TIMESTAMP,
+    source TEXT NOT NULL,  -- 'transcription' | 'autocomplete' | 'manual'
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_phrase_prefix ON autocomplete_phrases(phrase);
+CREATE INDEX idx_last_used ON autocomplete_phrases(last_used DESC);
+CREATE INDEX idx_frequency ON autocomplete_phrases(frequency DESC);
+```
+
+**Size management:**
+- Store top 10,000 phrases only
+- Prune based on: low frequency + low acceptance + old age
+- Export/import capability for power users
+
+---
+
+### UX Design
+
+#### Ghost Text Display (Standard Pattern)
+
+```
+User typing: "Best reg|"
+                     ↑ cursor
+
+Display:
+┌────────────────────────────────┐
+│ Best regards,                  │ ← Existing text (black)
+│ Octavian        │ ← Ghost text (gray 40% opacity)
+│                                │
+└────────────────────────────────┘
+
+Keyboard shortcuts:
+  Tab     → Accept entire suggestion
+  Ctrl+→  → Accept next word only
+  Esc     → Dismiss suggestion
+  Continue typing → Auto-dismiss
+```
+
+#### Multi-Suggestion UI (Optional Advanced Mode)
+
+```
+User typing: "Best reg|"
+
+Display dropdown:
+┌────────────────────────────────┐
+│ Best reg                       │ ← Current input
+├────────────────────────────────┤
+│ 1. Best regards, Octavian      │ ← Top suggestion (Tab)
+│ 2. Best regional practices     │ ← 2nd (Alt+2)
+│ 3. Best regards, Team          │ ← 3rd (Alt+3)
+└────────────────────────────────┘
+
+Scoring shown (debug mode):
+  "Best regards, Octavian" (score: 45.2)
+    - Frequency: 15
+    - Accepted: 8
+    - Last used: Today
+```
+
+---
+
+### Settings Configuration
+
+```yaml
+autocomplete:
+  # Core toggle
+  enabled: true
+
+  # Triggering behavior
+  trigger_after_chars: 3        # Start suggesting after N characters
+  trigger_delay_ms: 100         # Wait 100ms after typing stops
+
+  # Display options
+  display_mode: "ghost_text"    # "ghost_text" | "dropdown" | "both"
+  max_suggestions: 5            # Show top 5 in dropdown
+  ghost_text_opacity: 0.4       # 40% opacity for ghost text
+
+  # Learning behavior
+  learn_from_transcriptions: true   # Learn from voice dictation
+  learn_from_accepted: true         # Learn from accepted suggestions
+  learn_from_typing: false          # Learn from manual typing (privacy!)
+
+  # Filtering
+  min_phrase_length: 5          # Ignore very short phrases
+  max_phrase_length: 100        # Ignore very long phrases
+  exclude_apps: []              # Apps to disable autocomplete (e.g., password managers)
+
+  # Database management
+  max_phrases: 10000            # Storage limit
+  prune_threshold_days: 90      # Delete phrases not used in 90 days
+
+  # Keyboard shortcuts
+  accept_key: "Tab"
+  accept_word_key: "Ctrl+Right"
+  dismiss_key: "Esc"
+```
+
+---
+
+### Privacy Considerations
+
+**What we track:**
+- ✅ **Transcriptions** - User explicitly dictated this text via Handy
+- ✅ **Accepted suggestions** - User explicitly chose this suggestion
+- ❌ **Rejected suggestions** - Only increment counter, don't store typed text
+- ❌ **Manual typing** - Default OFF, opt-in only with big warning
+
+**Privacy settings UI:**
+```
+┌─────────────────────────────────────────────┐
+│ Privacy Settings                            │
+├─────────────────────────────────────────────┤
+│ ☑ Learn from voice transcriptions           │
+│   (Text you dictated using Handy)           │
+│                                             │
+│ ☑ Learn from accepted suggestions           │
+│   (Suggestions you chose with Tab)          │
+│                                             │
+│ ☐ Learn from manual typing                  │
+│   ⚠️ Warning: This will store everything   │
+│   you type in all applications. Only       │
+│   enable if you understand the privacy     │
+│   implications.                             │
+│                                             │
+│ [Export Data] [Clear All Data]             │
+└─────────────────────────────────────────────┘
+```
+
+**Data export format (JSONL):**
+```jsonl
+{"phrase": "Best regards, Octavian", "frequency": 15, "accepted": 8, "last_used": "2025-01-15T10:30:00Z"}
+{"phrase": "Thanks for your time", "frequency": 8, "accepted": 5, "last_used": "2025-01-14T15:20:00Z"}
+```
+
+---
+
+### Context-Aware Suggestions (Phase 2)
+
+**Basic context detection:**
+
+```rust
+struct ContextualSuggestion {
+    phrase: String,
+    score: f32,
+    contexts: Vec<Context>,
+}
+
+enum Context {
+    App(String),              // "Slack", "Gmail", "VS Code"
+    TimeOfDay(TimeRange),     // Morning greetings vs evening sign-offs
+    DayOfWeek(DayOfWeek),     // "Have a great weekend" on Fridays
+    Language(String),         // English vs Spanish phrases
+}
+
+impl AutocompleteEngine {
+    fn suggest_with_context(
+        &self,
+        current_text: &str,
+        context: &CurrentContext,
+    ) -> Vec<ContextualSuggestion> {
+        // Boost scores for matching context
+        let mut suggestions = self.suggest(current_text, 100);
+
+        for suggestion in &mut suggestions {
+            // Check if suggestion was used in this app before
+            if suggestion.contexts.iter().any(|c| matches!(c, Context::App(app) if app == context.active_app)) {
+                suggestion.score *= 1.5;  // 50% boost for app match
+            }
+
+            // Check time of day
+            let current_hour = Utc::now().hour();
+            if current_hour < 12 && suggestion.text.contains("Good morning") {
+                suggestion.score *= 1.3;
+            }
+        }
+
+        suggestions.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        suggestions
+    }
+}
+```
+
+**Example context-aware behavior:**
+- **In Slack (morning):** "Good morning team!" ranked higher
+- **In Gmail (evening):** "Thanks for your time today." ranked higher
+- **In VS Code:** Code patterns like `function foo() {}` ranked higher
+- **On Fridays:** "Have a great weekend!" appears in suggestions
+
+---
+
+### Integration with Existing Features
+
+#### Combine with Text Replacements
+
+```rust
+// User types: "this/th|"
+// Autocomplete suggests: "this/that" (from replacement rules)
+// Also suggests: "this/that approach" (from past transcriptions)
+
+// Pipeline:
+// 1. Check text replacements first (exact match priority)
+// 2. Then check autocomplete database (fuzzy/prefix match)
+// 3. Merge results, prioritize replacements
+```
+
+#### Combine with Voice Commands
+
+```rust
+// User dictates: "quote hello world unquote"
+// Voice command triggers: wrap "hello world" in quotes → "hello world"
+// Autocomplete learns: phrase="\"hello world\"", source=transcription
+
+// Future typing:
+// User types: "hello wo|"
+// Autocomplete suggests: "hello world" (with quotes, from voice pattern)
+```
+
+---
+
+### Performance Considerations
+
+**Lookup speed:**
+- SQLite with prefix index: ~1-5ms for 10,000 phrases
+- In-memory cache of top 1,000 phrases: ~0.1ms
+- Acceptable latency while typing (trigger after 100ms pause)
+
+**Memory usage:**
+- 10,000 phrases × ~50 bytes average = ~500KB
+- Negligible compared to loaded models (GB scale)
+
+**Database size:**
+- 10,000 phrases in SQLite: ~2-5MB
+- Export to JSONL: ~1-2MB
+- Auto-vacuum on prune operations
+
+---
+
+### Future Enhancements
+
+#### Machine Learning Phase (Phase 3)
+
+Once basic version proves useful:
+
+1. **Embedding-based similarity:**
+   - Generate embeddings for phrases
+   - Suggest semantically similar phrases (not just prefix match)
+   - "Best regards" → suggests "Sincerely" even though different text
+
+2. **Sequence prediction:**
+   - Use small LLM to predict next likely phrase
+   - "Thanks for" → "your time", "the update", "reaching out"
+   - Train on user's own transcriptions (privacy-preserving)
+
+3. **Multi-language support:**
+   - Detect language of current input
+   - Suggest from appropriate language corpus
+   - Code-switching support (Spanish + English phrases)
+
+---
+
+### Why This Feature Fits Handy Perfectly
+
+**Synergy with core functionality:**
+- Users already teach Handy their vocabulary through voice
+- Voice transcriptions are high-quality training data (complete sentences)
+- Users explicitly approve transcriptions (implicit quality signal)
+- Natural progression: voice → autocomplete → full writing assistant
+
+**Competitive advantage:**
+- No other STT tool offers this (most are single-purpose)
+- Transforms Handy into daily-use productivity tool
+- Increases engagement: useful even when not dictating
+- Network effect: more you use voice, better autocomplete becomes
+
+**Low implementation risk:**
+- Start simple (frequency-based, no AI needed)
+- Additive feature (doesn't change existing functionality)
+- Easy to disable if not useful
+- Privacy-conscious by default (only learns from voice)
+
+---
+
+## Python Model Integration Architecture
+
+### The Problem: Supporting Python-Only Models
+
+Many cutting-edge STT models are Python-only:
+- NVIDIA Canary (NeMo toolkit)
+- WhisperX (with diarization)
+- Assembly AI models (Python SDK)
+- Research models before ONNX export
+
+**Challenge:** Handy is Rust-based, these models require Python runtime.
+
+---
+
+### Solution: Long-Running Python Process with Pre-warming
+
+#### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────┐
+│ Handy App Launch                                │
+│ ─────────────────────────────────────────────── │
+│ [0ms]   Handy starts                            │
+│ [100ms] User selects "Canary Qwen 2.5B"         │
+│ [100ms] → Spawn Python process (background)     │
+│         → Load model (blocking Python-side)     │
+│ [3000ms] ← "READY" signal received              │
+│ [3100ms] UI shows "Ready to transcribe" ✓       │
+│                                                 │
+│ Python process now IDLE, waiting...             │
+└─────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────┐
+│ First Transcription                             │
+│ ─────────────────────────────────────────────── │
+│ [0ms]    User presses hotkey                    │
+│ [1500ms] Recording complete                     │
+│ [1500ms] Save audio to temp WAV file            │
+│ [1505ms] → Send path to Python via stdin        │
+│ [1550ms] ← Receive transcription via stdout     │
+│ [1550ms] Paste to application ✓                 │
+│                                                 │
+│ Total: 1550ms (NO Python startup penalty!)     │
+└─────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────┐
+│ Subsequent Transcriptions                       │
+│ ─────────────────────────────────────────────── │
+│ [0ms]    Hotkey → [1500ms] Recording            │
+│ [1505ms] → Send to Python (still running!)      │
+│ [1550ms] ← Result                               │
+│                                                 │
+│ Consistent ~50ms overhead (not 3-5 seconds!)    │
+└─────────────────────────────────────────────────┘
+```
+
+---
+
+### Implementation Details
+
+#### Rust Side: Long-Running Process Manager
+
+```rust
+pub struct LongRunningPythonProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    stderr: BufReader<ChildStderr>,
+    model_id: String,
+    last_request_time: Arc<Mutex<Instant>>,
+}
+
+impl LongRunningPythonProcess {
+    /// Creates new Python process and waits for model to load
+    pub fn new(model_id: &str) -> Result<Self> {
+        let start = Instant::now();
+        println!("Starting Python process for {}...", model_id);
+
+        // Spawn Python server
+        let mut child = Command::new("python3")
+            .arg("-u")  // Critical: unbuffered output
+            .arg("scripts/model_server.py")
+            .arg("--model")
+            .arg(model_id)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Failed to spawn Python process")?;
+
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let stderr = BufReader::new(child.stderr.take().unwrap());
+
+        // Wait for "READY" signal (blocks until model loaded)
+        let mut ready_signal = String::new();
+        match stdout.read_line(&mut ready_signal) {
+            Ok(_) if ready_signal.contains("READY") => {
+                let duration = start.elapsed();
+                println!("✓ Model loaded (took {}ms)", duration.as_millis());
+            },
+            Ok(_) => {
+                return Err(anyhow!("Unexpected output: {}", ready_signal));
+            },
+            Err(e) => {
+                // Read stderr for error details
+                let mut error_msg = String::new();
+                let _ = stderr.read_to_string(&mut error_msg);
+                return Err(anyhow!("Python startup failed: {}\n{}", e, error_msg));
+            }
+        }
+
+        Ok(Self {
+            child,
+            stdin: child.stdin.take().unwrap(),
+            stdout,
+            stderr,
+            model_id: model_id.to_string(),
+            last_request_time: Arc::new(Mutex::new(Instant::now())),
+        })
+    }
+
+    /// Send transcription request to Python process
+    pub fn transcribe(&mut self, audio_path: &Path) -> Result<String> {
+        // Build request
+        let request = json!({
+            "action": "transcribe",
+            "audio_path": audio_path.to_string_lossy(),
+            "timestamp": Utc::now().to_rfc3339(),
+        });
+
+        // Send request
+        writeln!(self.stdin, "{}", request)
+            .context("Failed to write to Python stdin")?;
+        self.stdin.flush()
+            .context("Failed to flush stdin")?;
+
+        *self.last_request_time.lock().unwrap() = Instant::now();
+
+        // Read response
+        let mut response_line = String::new();
+        self.stdout.read_line(&mut response_line)
+            .context("Failed to read from Python stdout")?;
+
+        // Parse JSON response
+        let response: serde_json::Value = serde_json::from_str(&response_line)
+            .context("Failed to parse Python response as JSON")?;
+
+        // Check for errors
+        if let Some(error) = response.get("error") {
+            return Err(anyhow!("Python error: {}", error));
+        }
+
+        // Extract text
+        let text = response["text"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Response missing 'text' field"))?
+            .to_string();
+
+        Ok(text)
+    }
+
+    /// Check if Python process is still alive
+    pub fn is_alive(&self) -> bool {
+        self.child.try_wait().ok().flatten().is_none()
+    }
+
+    /// Restart crashed/hung process
+    pub fn restart(&mut self) -> Result<()> {
+        println!("Restarting Python process for {}...", self.model_id);
+        self.shutdown()?;
+        *self = Self::new(&self.model_id)?;
+        Ok(())
+    }
+
+    /// Gracefully shutdown Python process
+    pub fn shutdown(&mut self) -> Result<()> {
+        // Send shutdown command
+        let _ = writeln!(self.stdin, r#"{{"action":"shutdown"}}"#);
+        let _ = self.stdin.flush();
+
+        // Wait for process to exit (with timeout)
+        match self.child.wait_timeout(Duration::from_secs(5))? {
+            Some(status) => {
+                println!("Python process exited: {}", status);
+            },
+            None => {
+                println!("Python process didn't exit, killing...");
+                self.child.kill()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get idle time (for auto-shutdown)
+    pub fn idle_duration(&self) -> Duration {
+        self.last_request_time.lock().unwrap().elapsed()
+    }
+}
+
+impl Drop for LongRunningPythonProcess {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+```
+
+---
+
+#### Python Side: Generic Model Server
+
+```python
+#!/usr/bin/env python3
+"""
+Generic model server for Handy.
+Supports multiple Python-based STT models via plugin architecture.
+"""
+
+import sys
+import json
+import argparse
+import traceback
+from pathlib import Path
+
+# Model loaders (plugin system)
+def load_canary_model(model_id: str):
+    """Load NVIDIA Canary model via NeMo."""
+    from nemo.collections.speechlm2.models import SALM
+    model = SALM.from_pretrained(model_id)
+
+    def transcribe(audio_path: str) -> str:
+        result = model.generate(
+            prompts=[[{
+                "role": "user",
+                "content": "Transcribe: {audio_locator}",
+                "audio": [audio_path]
+            }]],
+            max_new_tokens=128
+        )
+        return result[0]
+
+    return transcribe
+
+def load_whisperx_model(model_id: str):
+    """Load WhisperX with diarization."""
+    import whisperx
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = whisperx.load_model(model_id, device)
+
+    def transcribe(audio_path: str) -> str:
+        audio = whisperx.load_audio(audio_path)
+        result = model.transcribe(audio)
+        return result["text"]
+
+    return transcribe
+
+# Model registry
+MODEL_LOADERS = {
+    "canary-qwen-2.5b": load_canary_model,
+    "nvidia/canary-qwen-2.5b": load_canary_model,
+    "whisperx-large": load_whisperx_model,
+    # Add more models here
+}
+
+def load_model(model_id: str):
+    """Load model based on ID."""
+    for pattern, loader in MODEL_LOADERS.items():
+        if pattern in model_id:
+            return loader(model_id)
+
+    raise ValueError(f"Unknown model: {model_id}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Handy Python Model Server")
+    parser.add_argument("--model", required=True, help="Model ID to load")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    args = parser.parse_args()
+
+    try:
+        # Load model (this may take 3-5 seconds)
+        if args.debug:
+            print(f"Loading model: {args.model}", file=sys.stderr, flush=True)
+
+        transcribe_fn = load_model(args.model)
+
+        # Signal ready
+        print("READY", flush=True)
+
+        if args.debug:
+            print("Model loaded, waiting for requests...", file=sys.stderr, flush=True)
+
+        # Process requests in loop
+        for line in sys.stdin:
+            try:
+                request = json.loads(line)
+                action = request.get("action")
+
+                if action == "shutdown":
+                    if args.debug:
+                        print("Shutdown requested", file=sys.stderr, flush=True)
+                    break
+
+                elif action == "transcribe":
+                    audio_path = request["audio_path"]
+
+                    if args.debug:
+                        print(f"Transcribing: {audio_path}", file=sys.stderr, flush=True)
+
+                    # Run inference
+                    text = transcribe_fn(audio_path)
+
+                    # Return result
+                    response = {
+                        "text": text,
+                        "model": args.model,
+                        "timestamp": request.get("timestamp", "")
+                    }
+                    print(json.dumps(response), flush=True)
+
+                else:
+                    # Unknown action
+                    response = {"error": f"Unknown action: {action}"}
+                    print(json.dumps(response), flush=True)
+
+            except Exception as e:
+                # Catch per-request errors, don't crash server
+                error_response = {
+                    "error": str(e),
+                    "traceback": traceback.format_exc() if args.debug else None
+                }
+                print(json.dumps(error_response), flush=True)
+
+                if args.debug:
+                    print(f"Error processing request: {e}", file=sys.stderr, flush=True)
+
+    except Exception as e:
+        # Fatal error during startup
+        print(json.dumps({"error": f"Fatal: {e}"}), flush=True)
+        if args.debug:
+            traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### Integration with TranscriptionManager
+
+```rust
+// In managers/transcription.rs
+
+pub enum LoadedEngine {
+    Whisper(WhisperEngine),          // Existing
+    Parakeet(ParakeetEngine),        // Existing
+    PythonProcess(LongRunningPythonProcess),  // NEW
+}
+
+impl TranscriptionManager {
+    pub fn load_model(&self, model_id: &str) -> Result<()> {
+        let model_info = self.model_manager.get_model_info(model_id)?;
+
+        let loaded_engine = match model_info.engine_type {
+            EngineType::Whisper => {
+                // Existing code
+                LoadedEngine::Whisper(engine)
+            },
+            EngineType::Parakeet => {
+                // Existing code
+                LoadedEngine::Parakeet(engine)
+            },
+            EngineType::PythonProcess => {
+                // NEW: Start Python process
+                let process = LongRunningPythonProcess::new(model_id)?;
+                LoadedEngine::PythonProcess(process)
+            },
+        };
+
+        // Store engine
+        *self.engine.lock().unwrap() = Some(loaded_engine);
+        Ok(())
+    }
+
+    pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
+        // Get engine
+        let mut engine_guard = self.engine.lock().unwrap();
+        let engine = engine_guard.as_mut().ok_or_else(|| {
+            anyhow!("No model loaded")
+        })?;
+
+        // Transcribe based on engine type
+        match engine {
+            LoadedEngine::Whisper(whisper) => {
+                // Existing code
+            },
+            LoadedEngine::Parakeet(parakeet) => {
+                // Existing code
+            },
+            LoadedEngine::PythonProcess(process) => {
+                // NEW: Python-based transcription
+
+                // 1. Save audio to temp WAV file
+                let temp_path = self.save_audio_to_temp(&audio)?;
+
+                // 2. Send to Python process
+                let text = process.transcribe(&temp_path)?;
+
+                // 3. Clean up temp file
+                std::fs::remove_file(temp_path)?;
+
+                text
+            },
+        }
+    }
+
+    fn save_audio_to_temp(&self, audio: &[f32]) -> Result<PathBuf> {
+        let temp_dir = std::env::temp_dir();
+        let timestamp = Utc::now().timestamp_millis();
+        let temp_path = temp_dir.join(format!("handy_temp_{}.wav", timestamp));
+
+        // Write WAV file
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        let mut writer = hound::WavWriter::create(&temp_path, spec)?;
+        for &sample in audio {
+            let amplitude = (sample * i16::MAX as f32) as i16;
+            writer.write_sample(amplitude)?;
+        }
+        writer.finalize()?;
+
+        Ok(temp_path)
+    }
+}
+```
+
+---
+
+### Model Registration System
+
+```rust
+// In managers/model.rs
+
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+    pub size_bytes: u64,
+    pub engine_type: EngineType,
+    pub requires_python: bool,           // NEW
+    pub python_requirements: Vec<String>, // NEW
+    pub estimated_load_time_ms: u64,     // NEW
+    pub is_downloaded: bool,
+}
+
+pub enum EngineType {
+    Whisper,
+    Parakeet,
+    PythonProcess,  // NEW
+}
+
+impl ModelManager {
+    pub fn get_available_models() -> Vec<ModelInfo> {
+        vec![
+            // Native models (existing)
+            ModelInfo {
+                id: "whisper-large-v3".to_string(),
+                name: "Whisper Large V3".to_string(),
+                size_bytes: 1_080_000_000,
+                engine_type: EngineType::Whisper,
+                requires_python: false,
+                python_requirements: vec![],
+                estimated_load_time_ms: 2000,
+                is_downloaded: true,
+            },
+
+            // Python models (NEW)
+            ModelInfo {
+                id: "canary-qwen-2.5b".to_string(),
+                name: "NVIDIA Canary Qwen 2.5B".to_string(),
+                size_bytes: 2_500_000_000,
+                engine_type: EngineType::PythonProcess,
+                requires_python: true,
+                python_requirements: vec![
+                    "nemo-toolkit>=2.5.0".to_string(),
+                    "torch>=2.6.0".to_string(),
+                ],
+                estimated_load_time_ms: 4000,
+                is_downloaded: Self::check_python_model_available("nvidia/canary-qwen-2.5b"),
+            },
+
+            ModelInfo {
+                id: "whisperx-large".to_string(),
+                name: "WhisperX Large (with diarization)".to_string(),
+                size_bytes: 1_500_000_000,
+                engine_type: EngineType::PythonProcess,
+                requires_python: true,
+                python_requirements: vec![
+                    "whisperx".to_string(),
+                ],
+                estimated_load_time_ms: 5000,
+                is_downloaded: Self::check_python_model_available("large-v2"),
+            },
+        ]
+    }
+
+    fn check_python_model_available(model_id: &str) -> bool {
+        // Try to run Python script to check if model is available
+        Command::new("python3")
+            .arg("-c")
+            .arg(format!(r#"
+import sys
+try:
+    # Attempt to check if model exists without downloading
+    # (Implementation depends on model type)
+    print("OK")
+    sys.exit(0)
+except:
+    sys.exit(1)
+"#))
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+}
+```
+
+---
+
+### UI Integration
+
+**Model selector shows Python requirements:**
+
+```
+Available Models:
+┌────────────────────────────────────────────────┐
+│ ✓ Whisper Large V3 (Native, 1.08GB)           │
+│   Load time: ~2s                               │
+│                                                │
+│ ✓ Parakeet V3 (Native, 850MB)                 │
+│   Load time: ~2s                               │
+│                                                │
+│ ⚡ NVIDIA Canary Qwen 2.5B (Python, 2.5GB)    │
+│   Load time: ~4s                               │
+│   Requires: nemo-toolkit>=2.5.0, torch>=2.6.0  │
+│   [Install Dependencies]                       │
+│                                                │
+│ ⚡ WhisperX Large (Python, 1.5GB)             │
+│   Load time: ~5s                               │
+│   Requires: whisperx                           │
+│   [Install Dependencies]                       │
+└────────────────────────────────────────────────┘
+
+Legend:
+  ✓  = Native (fastest, no dependencies)
+  ⚡ = Python (slower startup, cutting-edge features)
+```
+
+**Installing dependencies:**
+
+```rust
+async fn install_python_dependencies(requirements: &[String]) -> Result<()> {
+    let progress_window = show_progress_window("Installing Python packages...");
+
+    for requirement in requirements {
+        progress_window.set_message(&format!("Installing {}...", requirement));
+
+        let output = Command::new("pip3")
+            .arg("install")
+            .arg(requirement)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Err(anyhow!("Failed to install {}: {}",
+                requirement,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+
+    progress_window.close();
+    Ok(())
+}
+```
+
+---
+
+### Error Handling & Recovery
+
+#### Process Crashes
+
+```rust
+impl TranscriptionManager {
+    pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
+        let result = match &mut *self.engine.lock().unwrap() {
+            Some(LoadedEngine::PythonProcess(process)) => {
+                // Check if process is alive
+                if !process.is_alive() {
+                    eprintln!("Python process died, restarting...");
+                    process.restart()?;
+                }
+
+                // Try transcription
+                match process.transcribe(&audio_path) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        eprintln!("Transcription error: {}, restarting process...", e);
+                        process.restart()?;
+
+                        // Retry once after restart
+                        process.transcribe(&audio_path)?
+                    }
+                }
+            },
+            // ... other engines
+        };
+
+        Ok(result)
+    }
+}
+```
+
+#### Timeouts
+
+```rust
+pub fn transcribe_with_timeout(
+    &mut self,
+    audio_path: &Path,
+    timeout: Duration
+) -> Result<String> {
+    use tokio::time::timeout;
+
+    let result = timeout(timeout, async {
+        self.transcribe(audio_path)
+    }).await;
+
+    match result {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            eprintln!("Transcription timed out, restarting process...");
+            self.restart()?;
+            Err(anyhow!("Transcription timed out after {:?}", timeout))
+        }
+    }
+}
+```
+
+#### Health Checks
+
+```rust
+// Background thread monitors Python process health
+async fn monitor_python_health(process: Arc<Mutex<Option<LongRunningPythonProcess>>>) {
+    loop {
+        sleep(Duration::from_secs(30)).await;
+
+        let mut guard = process.lock().unwrap();
+        if let Some(proc) = guard.as_mut() {
+            // Check if process is alive
+            if !proc.is_alive() {
+                eprintln!("Python process died, restarting...");
+                let _ = proc.restart();
+            }
+
+            // Check if process is idle for too long (optional auto-shutdown)
+            if proc.idle_duration() > Duration::from_secs(600) {
+                println!("Python process idle for 10min, shutting down to save memory...");
+                proc.shutdown().ok();
+                *guard = None;
+            }
+        }
+    }
+}
+```
+
+---
+
+### Performance Characteristics
+
+| Metric | Subprocess (each call) | Long-Running Process |
+|--------|------------------------|----------------------|
+| **First call startup** | 3-5 seconds | 3-5 seconds (at app launch) |
+| **Model load time** | Every call | Once (at startup) |
+| **Subsequent calls** | 3-5 seconds | 10-100ms |
+| **Memory overhead** | High (process per call) | Low (one process) |
+| **IPC overhead** | High (process spawn) | Low (stdin/stdout) |
+| **Scalability** | Poor (each call is slow) | Good (amortized cost) |
+
+**Real-world measurements (Canary Qwen 2.5B):**
+- App launch → Python ready: ~4 seconds
+- First transcription (5s audio): ~600ms (mostly model inference)
+- Subsequent transcriptions: ~600ms (no startup penalty!)
+- Idle memory: ~2.5GB (Python + model)
+
+---
+
+### Why This Architecture Works
+
+**Pre-warming benefits:**
+- ✅ Startup cost paid once (app launch), not per transcription
+- ✅ User expectation: apps take time to start, transcriptions should be fast
+- ✅ Similar to game asset loading: load during splash screen, not gameplay
+
+**Long-running process benefits:**
+- ✅ Model stays in GPU memory (fast subsequent calls)
+- ✅ Python runtime stays loaded (no interpreter startup)
+- ✅ Simple IPC (stdin/stdout, no complex protocol)
+- ✅ Easy debugging (can test Python script standalone)
+
+**Alternative rejection reasons:**
+- ❌ **Basic subprocess:** Too slow (3-5s per call unacceptable)
+- ❌ **PyO3:** Too complex, requires building Python bindings
+- ❌ **ONNX:** Not available for Canary (yet)
+- ✅ **Long-running process:** Sweet spot of simplicity + performance
+
+---
+
+### Extensibility: Adding New Python Models
+
+**To add a new Python model (e.g., Moonshine):**
+
+1. **Add loader function in Python:**
+```python
+def load_moonshine_model(model_id: str):
+    import moonshine
+    model = moonshine.load_model(model_id)
+
+    def transcribe(audio_path: str) -> str:
+        return model.transcribe(audio_path)
+
+    return transcribe
+
+MODEL_LOADERS["moonshine-base"] = load_moonshine_model
+```
+
+2. **Register in ModelManager:**
+```rust
+ModelInfo {
+    id: "moonshine-base".to_string(),
+    name: "Moonshine Base (Lightweight)".to_string(),
+    engine_type: EngineType::PythonProcess,
+    requires_python: true,
+    python_requirements: vec!["moonshine-asr".to_string()],
+    estimated_load_time_ms: 1000,
+    is_downloaded: check_python_model_available("moonshine-base"),
+}
+```
+
+3. **Done!** No Rust code changes needed, just Python plugin + model registration.
+
+---
+
+### Future Optimization: Shared Python Pool
+
+For power users with multiple Python models:
+
+```rust
+pub struct PythonProcessPool {
+    processes: HashMap<String, LongRunningPythonProcess>,
+    max_processes: usize,
+}
+
+impl PythonProcessPool {
+    // Pre-load multiple models
+    pub fn preload_models(&mut self, model_ids: &[String]) {
+        for model_id in model_ids {
+            if self.processes.len() < self.max_processes {
+                let process = LongRunningPythonProcess::new(model_id).ok();
+                if let Some(proc) = process {
+                    self.processes.insert(model_id.clone(), proc);
+                }
+            }
+        }
+    }
+
+    // Get or create process for model
+    pub fn get_or_create(&mut self, model_id: &str) -> Result<&mut LongRunningPythonProcess> {
+        if !self.processes.contains_key(model_id) {
+            let process = LongRunningPythonProcess::new(model_id)?;
+            self.processes.insert(model_id.to_string(), process);
+        }
+
+        Ok(self.processes.get_mut(model_id).unwrap())
+    }
+}
+```
+
+**Benefit:** Switch between models without reloading (if enough RAM)
+
+---
+
 ## Next Steps (Updated)
 1. ✅ Implement multi-word text replacements (HashMap approach)
 2. ✅ Add voice formatting commands ("this/that", "quote unquote")
 3. ✅ Phase 1: Hotkey to re-paste last transcription
-4. 🔬 Design post-transcription pipeline architecture (blocking vs async phases)
-5. 🔬 Implement webhook system (easy win, maximum flexibility)
-6. 🔬 Prototype small LLM integration (Granite 3.1, Qwen3, Jan Nano via Ollama)
-7. 🔬 Spike: Notion/Obsidian/GitHub sync architecture
-8. 🔬 Research: Additional STT model integration (Distil-Whisper, Moonshine)
-9. 📝 Design: Human-readable transcript storage (JSONL format)
-10. 📝 Design: Pipeline configuration UI/UX
+4. ✅ Character-by-character typing effect for text replacement (finalized UX)
+5. 🔬 Design post-transcription pipeline architecture (blocking vs async phases)
+6. 🔬 Implement webhook system (easy win, maximum flexibility)
+7. 🔬 Prototype small LLM integration (Granite 3.1, Qwen3, Jan Nano via Ollama)
+8. 🔬 Spike: Notion/Obsidian/GitHub sync architecture
+9. 🔬 Research: Additional STT model integration (Distil-Whisper, Moonshine)
+10. 📝 Design: Human-readable transcript storage (JSONL format)
+11. 📝 Design: Pipeline configuration UI/UX
+12. 🆕 Implement autocomplete engine (frequency-based, learn from transcriptions)
+13. 🆕 Implement long-running Python process architecture
+14. 🆕 Add NVIDIA Canary Qwen 2.5B as first Python-based model
+15. 🆕 Build generic Python model plugin system for extensibility
